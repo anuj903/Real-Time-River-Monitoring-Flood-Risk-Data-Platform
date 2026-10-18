@@ -1,0 +1,6 @@
+confluent-kafka
+httpx
+python-dotenv
+pydantic
+pyyaml
+psycopg[binary]

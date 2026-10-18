@@ -1,0 +1,441 @@
+Real-Time River Monitoring & Flood Risk Data Platform
+Current stage: Ingestion pipeline working
+Project overview
+A near-real-time data engineering platform that collects river water observations from France's Hub’Eau Hydrometry API, transports them through Apache Kafka, and stores them in TimescaleDB for time-series analysis and future flood-risk monitoring.
+Data source
+Hub’Eau API
+
+Message broker
+Apache Kafka
+
+Operational database
+TimescaleDB
+
+Development environment
+Python + Docker
+
+
+
+Current flow: Hub’Eau API → Python producer → Kafka → Python consumer → TimescaleDB
+
+1. Project objectives
+The project has two goals.
+Primary goal — engineering: Learn how to design, build, operate, and eventually deploy a production-grade data engineering pipeline using streaming technologies.
+Business goal — river monitoring: Collect water-level and eventually river-discharge observations, maintain historical data, analyze trends, and later support monitoring and flood-risk indicators.
+The longer-term objective is to evolve beyond a basic API-to-database script into a platform demonstrating:
+- Near-real-time ingestion and message streaming.
+- Reliable delivery, retry, recovery, and deduplication.
+- Time-series storage and efficient queries.
+- Data lake and Medallion architecture.
+- Data quality, observability, and orchestration.
+- APIs, dashboards, and deployment to the cloud.
+Important scope distinction: The ingestion pipeline is currently working. Flood prediction, risk classification, dashboards, and cloud deployment are future stages—not completed features.
+2. Overall architecture
+1. Hub’Eau Hydrometry API
+River observations: water height and discharge
+
+2. Python producer
+Fetch API data, normalize readings, publish JSON messages
+
+3. Apache Kafka
+Topic: water.observations.raw
+Persistent event log and decoupling between producer and consumer
+
+4. Python consumer
+Consume messages, validate, write transactionally
+
+Raw deliveries
+observation_events
+Every received Kafka message
+
+
+Canonical data
+observations
+One row per observation identity
+
+
+
+
+Current versus planned components
+Component	Status	Purpose
+Hub’Eau API integration	Implemented	Source of river measurements
+Python producer	Running	Fetches observations and publishes events
+Kafka in Docker	Running	Buffers and retains messages
+Python consumer	Running	Reads Kafka messages and writes to the database
+TimescaleDB in Docker	Running	Stores raw deliveries and canonical observations
+DBeaver	Working	Database inspection and SQL queries
+Spark Structured Streaming	Planned	Distributed stream processing and transformations
+Google Cloud Storage (GCS)	Planned	Cloud data lake
+FastAPI	Planned	Data access and application API
+Plotly Dash	Planned	Monitoring dashboard
+Airflow	Planned	Scheduled workflows, backfills, and data-quality jobs
+Cloud deployment	Planned	Long-running, externally accessible pipeline
+The project uses a local-first approach. We should establish reliability and correctness before introducing additional infrastructure.
+3. Technology stack and why we chose it
+Technology	Role in this project	What you learn
+Python	Producer, consumer, transformations	API integration, application logic, error handling
+Hub’Eau API	External data source	REST APIs, pagination, timestamps, source-data limitations
+Apache Kafka 4.1.0	Event streaming	Topics, partitions, offsets, consumer groups, delivery semantics
+confluent-kafka	Python Kafka client	Message production, consumption, offset management
+Docker Compose	Runs Kafka and TimescaleDB	Containers, networking, configuration, persistence
+PostgreSQL 17	Relational database engine	SQL, transactions, constraints, indexing
+TimescaleDB 2.30.0	Time-series database extension	Hypertables, chunking, time-series query optimization
+DBeaver	Database client	SQL execution, schema inspection, debugging
+httpx	HTTP API requests	Timeouts, request errors, API communication
+python-dotenv	Environment configuration	Externalized configuration and secret management
+Versions above are the versions selected or reported in the current setup, not necessarily the latest releases.
+Why use both Kafka and TimescaleDB?
+They solve different problems.
+- Kafka is the event transport and retained message log. It decouples data collection from database processing.
+- TimescaleDB is the queryable storage layer. It supports SQL queries over historical measurements.
+- The producer and consumer are separate applications, so either can be restarted without necessarily stopping the other.
+Kafka is not a replacement for a database, and TimescaleDB is not a replacement for a message broker.
+4. Data source: Hub’Eau Hydrometry API
+The project uses the French Hub’Eau Hydrometry API, specifically its observations_tr endpoint.
+Current source configuration
+Setting	Current value
+Station ID	Y251002001
+Station	L’Orb à Bédarieux, France
+Measurement type	H — water height
+Unit	mm
+Source identifier	hubeau
+Endpoint family	observations_tr
+Producer lookback	Last 60 minutes
+Polling behavior	Repeated polling
+Data format	JSON
+Hub’Eau exposes river measurements, but the availability and frequency of readings depend on the station and measurement type. API refresh frequency is not the same as the physical measurement frequency.
+Water measurements to support
+- H — Water height: the height of the water, currently stored in millimetres.
+- Q — Discharge: the volume of water flowing through a cross-section per unit of time, commonly expressed in litres per second for this source.
+The current pipeline focuses on H. Q can be added after we confirm the source response, unit handling, and database behavior.
+Important API concepts to document
+- REST requests and query parameters.
+- Start and end timestamps.
+- Cursor pagination for observations_tr.
+- HTTP timeouts and retries.
+- API rate limits and request-range limitations.
+- Missing observations and delayed source updates.
+- Timestamp parsing and timezone preservation.
+The API is an external dependency. Kafka cannot collect observations directly from Hub’Eau; the Python producer makes the requests.
+5. Producer: API to Kafka
+The producer is a Python application running on the development machine, outside the Docker containers.
+Its responsibility is to fetch source observations and publish each reading as a Kafka message.
+Current workflow
+1. Poll Hub’Eau for the configured station and measurement type.
+2. Request observations covering the previous 60 minutes.
+3. Parse the API response.
+4. Convert each reading into a normalized JSON event.
+5. Publish the event to water.observations.raw.
+6. Use the station ID as the Kafka message key.
+7. Continue polling and log errors when requests fail.
+Event structure
+A message contains these fields:
+Field	Meaning
+station_id	Identifier of the monitoring station
+observation_time	Time the measurement was recorded
+measurement_type	Type of measurement, such as H
+value	Numeric reading
+unit	Measurement unit, such as mm
+source	Origin of the reading, currently hubeau
+ingested_at	Time the producer ingested the source reading
+Timestamps are timezone-aware and should be stored as PostgreSQL timestamptz.
+Kafka message key
+The producer uses station_id as the Kafka key.
+This allows messages for the same station to be routed to the same partition under the current partitioning setup. Kafka preserves order within a partition, not globally across all partitions.
+Existing producer issue: overlapping polls
+The producer repeatedly fetches the last 60 minutes. Therefore, a reading can be published more than once.
+For example, a reading fetched at 10:00 may be fetched again at 10:05. The two Kafka messages can have identical observation fields but different ingested_at values.
+This is expected with the current polling strategy. It is not automatically a Kafka defect.
+Existing resilience behavior
+The producer previously encountered an httpx.ReadTimeout after 30 seconds. It logged the error and continued with a subsequent poll, which successfully published observations.
+That demonstrates basic error recovery. However, successful recovery from a timeout does not guarantee that all missed observations are recovered.
+The producer still needs a durable collection checkpoint and a catch-up strategy.
+6. Kafka: event streaming layer
+Kafka is running in Docker using Apache Kafka 4.1.0 in KRaft mode.
+Current configuration
+Setting	Value
+Container name	water-kafka
+Topic	water.observations.raw
+Partitions	3
+Replication factor	1
+Host port	9092
+Mode	KRaft — no ZooKeeper
+The three partitions provide a basis for parallelism, although the current workload is small. Replication factor 1 is appropriate for a local development setup, but it does not provide broker-level redundancy.
+Key Kafka concepts
+- Broker: The Kafka server storing and serving records.
+- Topic: A named stream of messages.
+- Partition: An ordered sequence of messages within a topic.
+- Offset: A message's position within a partition.
+- Producer: Publishes messages.
+- Consumer: Reads messages.
+- Consumer group: Coordinates consumption among consumer instances.
+- Retention: Determines how long Kafka keeps messages.
+- Consumer offset: Records progress through a partition.
+Why Kafka is useful here
+The producer can publish events without needing to know whether the database consumer is currently running. Kafka can retain messages for later processing, subject to its retention and storage configuration.
+If the consumer stops while the producer continues, it can catch up on retained messages when it restarts, provided it resumes from the correct committed offsets.
+If both producer and consumer are stopped, however, no new source observations are fetched during that period.
+7. TimescaleDB: storage layer
+TimescaleDB runs in Docker on top of PostgreSQL 17.
+Current configuration
+Setting	Current value
+Container name	water-timescaledb
+Image	timescale/timescaledb:2.30.0-pg17
+Host port	5433
+Database	water_platform (configured name)
+Database client	DBeaver
+Storage approach	Hypertables with 7-day chunk intervals
+Port 5432 originally caused a conflict with another local PostgreSQL service, so the Docker service was moved to host port 5433.
+Connections from the host use localhost:5433. Applications running inside the same Docker Compose network generally use the database service name and its internal port, 5432.
+Keep database credentials in .env; never commit the real credentials to Git.
+Why TimescaleDB?
+A river monitoring platform produces timestamped measurements. TimescaleDB extends PostgreSQL with time-series capabilities, including:
+- Hypertables that partition data into time-based chunks.
+- SQL queries across time ranges.
+- Indexing and time-series query optimization.
+- Optional compression and retention policies as data volume grows.
+We deliberately haven't introduced compression or retention policies yet. First, we need to validate data correctness and ingestion reliability.
+8. Database schema
+We created two hypertables for two different purposes.
+Table A: observation_events
+Purpose: Preserve each Kafka delivery for traceability and ingestion auditing.
+The hypertable is partitioned on ingested_at, with 7-day chunks.
+Column	Type	Purpose
+topic	text	Kafka topic name
+kafka_partition	integer	Kafka partition
+kafka_offset	bigint	Kafka offset
+station_id	text	Monitoring station
+observation_time	timestamptz	Source measurement time
+measurement_type	text	Measurement type
+value	double precision	Numeric reading
+unit	text	Measurement unit
+source	text	Source system
+ingested_at	timestamptz	Producer ingestion timestamp
+received_at	timestamptz	Database consumer receipt time
+Primary key:
+(topic, kafka_partition, kafka_offset, ingested_at)
+The ingested_at column is included because the hypertable's time column must be part of a unique index.
+The raw table records Kafka deliveries, not unique physical observations. Consequently, two separate Kafka messages representing the same measurement may both be stored.
+The secondary index is:
+(station_id, observation_time)
+This supports searches for deliveries associated with a station and measurement time.
+Table B: observations
+Purpose: Store the canonical series used for normal analytical queries.
+The hypertable is partitioned on observation_time, with 7-day chunks.
+Column	Type	Purpose
+station_id	text	Monitoring station
+measurement_type	text	Measurement type
+observation_time	timestamptz	Measurement timestamp
+value	double precision	Accepted reading
+unit	text	Measurement unit
+source	text	Source identifier
+ingested_at	timestamptz	Ingestion timestamp of the winning delivery
+first_ingested_at	timestamptz	Ingestion timestamp from the first insert
+Primary key:
+(station_id, measurement_type, observation_time)
+This defines a canonical reading as one observation per station, measurement type, and timestamp.
+H and Q remain separate series because measurement_type is part of the key.
+Why two tables instead of one?
+Suppose the API returns the same water-height reading five times across overlapping polls.
+- observation_events can contain five separate Kafka deliveries.
+- observations should contain one canonical row for that measurement.
+This gives us both an audit trail and a clean analytical dataset.
+Canonical upsert behavior
+The intended database operation uses INSERT ... ON CONFLICT ... DO UPDATE.
+When a reading with the same canonical key arrives:
+- A newer ingested_at can update the accepted value and associated metadata.
+- An older delivery should not overwrite a newer accepted delivery.
+- first_ingested_at should remain unchanged.
+- Repeated deliveries should not create additional canonical rows.
+One subtle point: ingested_at indicates when the producer fetched a reading, not necessarily when the source measurement was last revised. It is a reasonable initial freshness rule, but source-specific revision logic may be needed later.
+Last reported database counts
+At the last reported checkpoint:
+Table	Rows
+observation_events	217
+observations	17
+These are historical counts from the project update, not verified live counts.
+9. Consumer: Kafka to TimescaleDB
+The consumer is another Python application running on the host machine.
+Its job is to read messages from Kafka, write them into the database, and manage progress safely.
+Intended processing workflow
+1. Subscribe to water.observations.raw.
+2. Consume a Kafka message.
+3. Deserialize and validate its JSON fields.
+4. Begin a database transaction.
+5. Insert the delivery into observation_events.
+6. Upsert the canonical reading into observations.
+7. Commit the database transaction.
+8. Commit the Kafka offset only after the database write succeeds.
+Why the order matters
+Kafka and PostgreSQL do not share a single transaction in this architecture.
+If the consumer commits a Kafka offset before the database transaction succeeds, the message could be skipped permanently when processing resumes.
+If the database transaction succeeds but the Kafka offset commit fails, the message may be processed again. Idempotent database operations are therefore essential.
+Our approach is designed for at-least-once processing with idempotent database writes, not a claim of end-to-end exactly-once delivery.
+Failure cases to handle
+Failure	Desired behavior
+Database temporarily unavailable	Retry without committing the affected offset
+Duplicate Kafka delivery	Preserve raw-delivery identity and avoid duplicate canonical rows
+Consumer restarts	Resume from committed offsets
+Invalid JSON or missing required fields	Log and handle explicitly; avoid infinite poison-message loops
+Database transaction fails	Roll back and do not commit the affected message's offset
+Shutdown requested	Stop gracefully and avoid committing unfinished work
+One implementation detail to verify in the current consumer is whether it commits offsets automatically or manually. The design above requires controlled offset commits after successful transactions.
+10. Current data-recovery limitation
+This is the most important known functional gap.
+The producer currently polls the previous 60 minutes. If you stop it for an entire night and restart the next morning, observations older than that rolling window may never be fetched.
+Kafka can replay messages that it already has. It cannot recover observations that the producer never requested or published.
+What we need to implement
+Durable producer checkpoints and catch-up ingestion.
+The producer should record the last successfully collected source time, request data from that checkpoint on restart, handle pagination, and advance the checkpoint only after the fetched data has been safely published.
+We must design this carefully so that partial API responses, failed Kafka publishes, and retries cannot cause silent data gaps. Overlapping polls can still be useful because downstream deduplication handles repeated readings.
+We should also verify Kafka's Docker volume and retention configuration before relying on its data surviving a full Docker shutdown.
+11. Docker and local development environment
+The two infrastructure services are managed using Docker Compose:
+- water-kafka
+- water-timescaledb
+The Python producer and consumer run in the Windows development environment, inside the project's .venv.
+The database is accessed through DBeaver.
+This arrangement is useful for development because it keeps infrastructure isolated while letting you debug Python applications directly from your terminal or editor.
+Important operational distinction
+Closing the producer or consumer terminal stops that Python process. It does not necessarily stop the Docker services.
+Stopping Docker services, stopping the producer, and stopping the consumer are three separate actions with different consequences.
+For long-running operation, we will eventually need process supervision, restart policies, persistent storage, monitoring, and deployment decisions.
+12. Current project structure
+The repository already has a modular structure. The main areas include:
+realtime-water-data-platform/
+├── src/
+│   ├── producer/
+│   │   ├── api_client.py
+│   │   ├── producer.py
+│   │   └── config.py
+│   ├── bronze/
+│   │   └── consumer.py
+│   ├── streaming/
+│   │   ├── spark_stream.py
+│   │   ├── transformations.py
+│   │   └── schemas.py
+│   ├── database/
+│   │   ├── connection.py
+│   │   └── queries.py
+│   └── common/
+│       ├── logging_config.py
+│       └── utils.py
+├── config/
+│   └── config.yaml
+├── docker/
+├── sql/
+│   ├── schemas/
+│   ├── tables/
+│   └── queries/
+├── tests/
+├── data/
+├── notebooks/
+├── .env
+├── .env.example
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+
+
+This is the intended/previously reported structure; inspect the repository for the exact current filenames before making further changes.
+The separation helps keep API logic, message processing, database access, configuration, and future transformations independent.
+13. What is implemented versus what remains
+Implemented
+Docker Compose environment with Kafka and TimescaleDB
+
+Kafka topic water.observations.raw
+
+Python producer fetching Hub’Eau readings
+
+Kafka message publishing using station_id as key
+
+Python consumer writing into TimescaleDB
+
+observation_events hypertable for raw deliveries
+
+observations hypertable for canonical readings
+
+DBeaver connection and schema verification
+
+
+Needs verification or implementation
+Confirm manual Kafka offset commits occur after database transactions
+
+Add durable producer checkpoints and restart catch-up
+
+Verify API pagination and historical backfill behavior
+
+Verify Kafka persistence volume and retention settings
+
+Test recovery from consumer crashes and database outages
+
+Add automated tests for deduplication and failure handling
+
+Add metrics, structured logs, and data-quality checks
+
+
+14. Planned architecture evolution
+We should add components only when there is a clear purpose for them.
+1. Reliable ingestion
+   Fix checkpoints, catch-up, pagination, retries, and recovery. Prove that stopping and restarting does not create silent gaps.
+2. Data quality and transformations
+   Validate timestamps, units, missing values, station identifiers, duplicates, and unexpected readings. Establish raw and cleaned data contracts.
+3. Google Cloud Storage and Medallion architecture
+   Introduce Bronze, Silver, and Gold layers. Bronze preserves source events, Silver stores validated and deduplicated data, and Gold provides analytical datasets.
+4. Spark Structured Streaming
+   Introduce distributed processing when we have defined transformations that benefit from it. Avoid adding Spark merely to duplicate what the current Python consumer already does.
+5. FastAPI and Plotly Dash
+   Expose useful data queries and build a monitoring dashboard for water height, historical trends, and later risk indicators.
+6. Airflow and operational workflows
+   Use scheduled orchestration for backfills, reconciliation, periodic quality checks, and maintenance—not as a replacement for the continuously running Kafka consumer.
+7. Deployment and observability
+   Deploy the components, configure secrets and persistent storage, monitor lag and failures, and test recovery. Choose hosting based on cost, uptime, and service limitations.
+15. Important concepts to learn and document
+These are the topics this project can demonstrate in a portfolio and technical interview.
+Topic	Questions this project should answer
+API ingestion	How do we fetch data reliably from an external API?
+Incremental loading	How do checkpoints prevent gaps after downtime?
+Kafka architecture	What are topics, partitions, offsets, and consumer groups?
+Delivery semantics	What is the difference between at-most-once, at-least-once, and exactly-once processing?
+Idempotency	How do we safely process a message more than once?
+Transactions	How do database transactions protect the two-table write?
+Time-series storage	Why use hypertables and time-based chunking?
+Schema design	Why separate raw deliveries from canonical observations?
+Event time vs. ingestion time	Why can measurement time differ from processing time?
+Data quality	How do we detect missing, delayed, invalid, or suspicious measurements?
+Backfills	How do we recover historical data without corrupting current ingestion?
+Observability	How do we detect lag, errors, missing data, and stalled pipelines?
+Cloud data lakes	How do Bronze, Silver, and Gold layers differ?
+Stream processing	When is Spark Structured Streaming useful?
+Orchestration	Which workflows belong in Airflow, and which should be continuously running services?
+Deployment	How do Docker, configuration, persistence, health checks, and restart policies fit together?
+16. Portfolio positioning
+A credible eventual project description could be:
+Designed and developed a near-real-time river monitoring data platform using Python, Apache Kafka, PostgreSQL/TimescaleDB, and Docker. Ingested hydrological observations from the Hub’Eau API, streamed events through Kafka, and implemented separate raw-delivery and canonical time-series storage with deduplication and transactional writes. The planned architecture extends to cloud data lake storage, stream processing, data-quality monitoring, and analytical APIs.
+
+Keep the final résumé wording aligned with what is actually completed. Once checkpoint recovery, testing, cloud storage, and monitoring are implemented and verified, the project description can be strengthened accordingly.
+
+17. Recommended documentation files
+I'd organize the project documentation into a small set of durable files rather than putting every detail into one oversized README.
+README.md
+Project overview, architecture diagram, technology stack, setup instructions, and current status.
+
+
+
+docs/architecture.md
+Component responsibilities, data flow, network configuration, failure handling, and architectural decisions.
+
+
+
+docs/data-model.md
+Event schema, hypertables, primary keys, indexes, idempotency rules, and example SQL queries.
+
+
+
+docs/learning-notes.md
+Kafka fundamentals, TimescaleDB concepts, implementation decisions, errors encountered, and lessons learned.
+
+
+
+docs/roadmap.md
+Completed milestones, open problems, next steps, acceptance criteria, and future cloud architecture.

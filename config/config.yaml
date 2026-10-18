@@ -1,0 +1,21 @@
+hubeau:
+  base_url: https://hubeau.eaufrance.fr/api/v2/hydrometrie
+  station_code: Y251002001
+  grandeur_hydro: H
+  # Hub'Eau expresses water height in millimetres. The API does not return a unit field.
+  unit: mm
+  lookback_minutes: 60
+  page_size: 500
+
+kafka:
+  bootstrap_servers: localhost:9092
+  topic: water.observations.raw
+
+producer:
+  poll_interval_seconds: 60
+
+consumer:
+  group_id: water-observations-bronze
+  poll_timeout_seconds: 1.0
+  retry_seconds: 5
+  auto_offset_reset: earliest
