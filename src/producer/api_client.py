@@ -5,6 +5,10 @@ from datetime import datetime
 import httpx
 
 
+class HubeauPageLimitError(RuntimeError):
+    """Raised when cursor pagination exceeds the configured page cap."""
+
+
 class HubeauClient:
     """Reads real-time hydrometric observations from Hub'Eau."""
 
@@ -20,8 +24,9 @@ class HubeauClient:
         grandeur_hydro: str,
         date_debut_obs: datetime,
         page_size: int,
+        max_pages: int,
     ) -> list[dict]:
-        """Return observations for one station since date_debut_obs, oldest last in the API order."""
+        """Return every page since date_debut_obs, or raise before a partial result is used."""
         params: dict | None = {
             "code_entite": station_code,
             "grandeur_hydro": grandeur_hydro,
@@ -30,14 +35,20 @@ class HubeauClient:
         }
         url: str | None = "/observations_tr"
         rows: list[dict] = []
+        pages = 0
 
         while url:
+            if pages >= max_pages:
+                raise HubeauPageLimitError(
+                    f"Hub'Eau returned more than {max_pages} page(s); refusing a partial window"
+                )
             response = self._client.get(url, params=params)
             response.raise_for_status()
             payload = response.json()
             rows.extend(payload.get("data") or [])
             url = payload.get("next")
             params = None
+            pages += 1
 
         return rows
 

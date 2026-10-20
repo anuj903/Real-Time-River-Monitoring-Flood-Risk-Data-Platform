@@ -56,6 +56,28 @@ class WriteObservationTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (station_id, measurement_type, observation_time)", connection._cursor.statements[1][0])
         self.assertTrue(connection.committed)
 
+
+class ReplayTests(unittest.TestCase):
+    def test_replaying_the_same_offset_runs_both_writes_again(self) -> None:
+        connection = FakeConnection(rowcounts=[1, 1, 0, 0])
+        record = _record()
+        kwargs = {
+            "topic": "water.observations.raw",
+            "kafka_partition": 2,
+            "kafka_offset": 10,
+        }
+
+        first = write_observation(connection, record, **kwargs)
+        second = write_observation(connection, record, **kwargs)
+
+        self.assertTrue(first.raw_inserted)
+        self.assertTrue(first.canonical_written)
+        self.assertFalse(second.raw_inserted)
+        self.assertFalse(second.canonical_written)
+        self.assertEqual(len(connection._cursor.statements), 4)
+        self.assertEqual(connection._cursor.statements[0][1]["kafka_offset"], 10)
+        self.assertEqual(connection._cursor.statements[2][1]["kafka_offset"], 10)
+
     def test_rolls_back_when_the_canonical_upsert_fails(self) -> None:
         connection = FakeConnection(rowcounts=[1], fail_on_call=2)
 

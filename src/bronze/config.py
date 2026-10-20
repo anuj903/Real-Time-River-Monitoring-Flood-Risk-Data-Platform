@@ -19,6 +19,7 @@ class ConsumerSettings:
     poll_timeout_seconds: float
     retry_seconds: float
     auto_offset_reset: str
+    max_poll_interval_ms: int
 
 
 def load_consumer_settings() -> ConsumerSettings:
@@ -35,4 +36,5 @@ def load_consumer_settings() -> ConsumerSettings:
         poll_timeout_seconds=float(consumer["poll_timeout_seconds"]),
         retry_seconds=float(consumer["retry_seconds"]),
         auto_offset_reset=consumer["auto_offset_reset"],
+        max_poll_interval_ms=int(consumer["max_poll_interval_ms"]),
     )

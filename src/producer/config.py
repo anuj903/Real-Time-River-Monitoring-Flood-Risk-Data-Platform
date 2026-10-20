@@ -20,6 +20,11 @@ class Settings:
     bootstrap_servers: str
     topic: str
     poll_interval_seconds: float
+    checkpoint_path: str
+    max_attempts: int
+    retry_backoff_seconds: float
+    max_pages: int
+    catchup_max_age_days: int
     source: str = "hubeau"
 
 
@@ -41,4 +46,9 @@ def load_settings() -> Settings:
         bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", kafka["bootstrap_servers"]),
         topic=kafka["topic"],
         poll_interval_seconds=float(producer["poll_interval_seconds"]),
+        checkpoint_path=producer["checkpoint_path"],
+        max_attempts=int(producer["max_attempts"]),
+        retry_backoff_seconds=float(producer["retry_backoff_seconds"]),
+        max_pages=int(producer["max_pages"]),
+        catchup_max_age_days=int(producer["catchup_max_age_days"]),
     )

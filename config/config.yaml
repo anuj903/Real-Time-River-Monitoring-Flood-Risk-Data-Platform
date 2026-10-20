@@ -13,9 +13,15 @@ kafka:
 
 producer:
   poll_interval_seconds: 60
+  checkpoint_path: data/checkpoints/producer.json
+  max_attempts: 3
+  retry_backoff_seconds: 2
+  max_pages: 100
+  catchup_max_age_days: 30
 
 consumer:
   group_id: water-observations-bronze
   poll_timeout_seconds: 1.0
   retry_seconds: 5
   auto_offset_reset: earliest
+  max_poll_interval_ms: 900000
