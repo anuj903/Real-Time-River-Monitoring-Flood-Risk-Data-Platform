@@ -113,7 +113,7 @@ class PollOnceTests(unittest.TestCase):
                 )
 
             self.assertEqual(published, 1)
-            self.assertIn("skipped malformed source row", " ".join(logs.output))
+            self.assertIn("event=source_row_skipped", " ".join(logs.output))
             stored = load_checkpoint(path, "Y251002001", "H")
             self.assertEqual(stored, datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc))
 
@@ -138,7 +138,7 @@ class PollOnceTests(unittest.TestCase):
             self.assertEqual(published, 1)
             self.assertEqual(producer.produced, 1)
             self.assertEqual(json.loads(producer.values[0])["value"], -280.0)
-            self.assertIn("duplicate source row", " ".join(logs.output))
+            self.assertIn("event=duplicate_source_row", " ".join(logs.output))
 
     def test_malformed_api_page_does_not_advance_the_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -153,6 +153,85 @@ class PollOnceTests(unittest.TestCase):
             self.assertEqual(producer.produced, 0)
             self.assertEqual(len(client.calls), 1)
             self.assertFalse(path.exists())
+
+    def test_published_poll_logs_counts_and_checkpoint_advancement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(str(Path(directory) / "producer.json"))
+            producer = FakeProducer()
+
+            with self.assertLogs("src.producer.producer", level="INFO") as logs:
+                poll_once(
+                    _client([_row("2026-10-20T10:00:00Z")]),
+                    producer,
+                    settings,
+                    threading.Event(),
+                    now=datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc),
+                )
+
+            text = " ".join(logs.output)
+            self.assertIn("event=poll_started", text)
+            self.assertIn("event=poll_published", text)
+            self.assertIn("pages=1", text)
+            self.assertIn("observations_received=1", text)
+            self.assertIn("rows_skipped=0", text)
+            self.assertIn("duplicate_source_rows=0", text)
+            self.assertIn("messages_published=1", text)
+            self.assertIn("checkpoint_advanced=true", text)
+            self.assertIn("duration_ms=", text)
+            self.assertNotIn("event=poll_empty", text)
+            self.assertNotIn("event=poll_failed", text)
+
+    def test_empty_poll_is_distinct_from_a_published_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "producer.json"
+            settings = _settings(str(path))
+
+            with self.assertLogs("src.producer.producer", level="INFO") as logs:
+                published = poll_once(_client([]), FakeProducer(), settings, threading.Event())
+
+            text = " ".join(logs.output)
+            self.assertEqual(published, 0)
+            self.assertIn("event=poll_empty", text)
+            self.assertIn("messages_published=0", text)
+            self.assertIn("checkpoint_advanced=false", text)
+            self.assertNotIn("event=poll_published", text)
+            self.assertFalse(path.exists())
+
+    def test_failed_poll_is_distinct_from_an_empty_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "producer.json"
+            settings = _settings(str(path), max_attempts=1)
+
+            with self.assertLogs("src.producer.producer", level="ERROR") as logs:
+                with self.assertRaises(httpx.ReadTimeout):
+                    poll_once(
+                        FakeClient(errors=[httpx.ReadTimeout("timed out")]),
+                        FakeProducer(),
+                        settings,
+                        threading.Event(),
+                    )
+
+            text = " ".join(logs.output)
+            self.assertIn("event=poll_failed", text)
+            self.assertIn("checkpoint_advanced=false", text)
+            self.assertIn("messages_published=0", text)
+            self.assertNotIn("event=poll_empty", text)
+            self.assertNotIn("event=poll_published", text)
+            self.assertFalse(path.exists())
+
+    def test_retry_logs_the_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(str(Path(directory) / "producer.json"), max_attempts=2)
+            client = FakeClient(errors=[httpx.ReadTimeout("timed out")], rows=[_row("2026-10-20T11:00:00Z")])
+
+            with self.assertLogs("src.producer.producer", level="WARNING") as logs:
+                poll_once(client, FakeProducer(), settings, threading.Event())
+
+            text = " ".join(logs.output)
+            self.assertIn("event=retry", text)
+            self.assertIn("operation=hubeau_fetch", text)
+            self.assertIn("attempt=1", text)
+            self.assertIn("max_attempts=2", text)
 
 
 def _settings(path: str, **overrides) -> Settings:
@@ -196,11 +275,14 @@ class FakeClient:
         self.rows = rows or []
         self.errors = list(errors or [])
         self.calls = []
+        self.pages_fetched = 0
 
     def fetch_observations(self, **kwargs):
         self.calls.append(kwargs)
         if self.errors:
+            self.pages_fetched = 0
             raise self.errors.pop(0)
+        self.pages_fetched = 1
         return self.rows
 
 

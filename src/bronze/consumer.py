@@ -4,14 +4,17 @@ import logging
 import signal
 import threading
 import time
+from datetime import datetime, timezone
 
 from confluent_kafka import Consumer, TopicPartition
 
 from src.bronze.config import ConsumerSettings, load_consumer_settings
 from src.bronze.messages import parse_event
+from src.common.log_events import log_event
 from src.common.logging_config import configure_logging
 from src.database.connection import DatabaseSettings, connect, load_database_settings
 from src.database.queries import ObservationRecord, WriteResult, write_observation
+from src.monitoring.health import PipelineMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +30,21 @@ class Assignment:
 
     def on_assign(self, consumer, partitions) -> None:
         self._partitions = {(partition.topic, partition.partition): partition for partition in partitions}
-        logger.info(
-            "assigned partitions=%s",
-            sorted(f"{topic}:{partition}" for topic, partition in self._partitions),
+        log_event(
+            logger,
+            logging.INFO,
+            "partitions_assigned",
+            partitions=",".join(sorted(f"{topic}:{partition}" for topic, partition in self._partitions)),
         )
 
     def on_revoke(self, consumer, partitions) -> None:
         for partition in partitions:
             self._partitions.pop((partition.topic, partition.partition), None)
-        logger.info(
-            "revoked partitions=%s",
-            sorted(f"{partition.topic}:{partition.partition}" for partition in partitions),
+        log_event(
+            logger,
+            logging.INFO,
+            "partitions_revoked",
+            partitions=",".join(sorted(f"{partition.topic}:{partition.partition}" for partition in partitions)),
         )
 
     def owns(self, message) -> bool:
@@ -93,21 +100,25 @@ def run() -> None:
         on_revoke=assignment.on_revoke,
     )
     conn = connect(database_settings)
-    logger.info(
-        "consuming topic=%s group_id=%s postgres_host=%s postgres_port=%s postgres_db=%s",
-        settings.topic,
-        settings.group_id,
-        database_settings.host,
-        database_settings.port,
-        database_settings.dbname,
+    monitor = PipelineMonitor("consumer")
+    log_event(
+        logger,
+        logging.INFO,
+        "consumer_started",
+        topic=settings.topic,
+        group_id=settings.group_id,
+        postgres_host=database_settings.host,
+        postgres_port=database_settings.port,
+        postgres_db=database_settings.dbname,
     )
     try:
         while not stop.is_set():
             message = assignment.pending.pop(0) if assignment.pending else consumer.poll(settings.poll_timeout_seconds)
             if message is None:
+                monitor.maybe_check()
                 continue
             if message.error():
-                logger.error("kafka error: %s", message.error())
+                log_event(logger, logging.ERROR, "kafka_error", error=message.error())
                 continue
             conn = _handle_message(
                 consumer,
@@ -117,15 +128,17 @@ def run() -> None:
                 message,
                 stop,
                 assignment,
+                monitor,
             )
+            monitor.maybe_check()
     finally:
         consumer.close()
         if conn is not None and not conn.closed:
             conn.close()
-        logger.info("consumer stopped")
+        log_event(logger, logging.INFO, "consumer_stopped")
 
 
-def _handle_message(consumer, conn, database_settings, settings, message, stop: threading.Event, assignment: Assignment):
+def _handle_message(consumer, conn, database_settings, settings, message, stop: threading.Event, assignment: Assignment, monitor: PipelineMonitor | None = None):
     try:
         record = parse_event(
             message.value(),
@@ -133,68 +146,107 @@ def _handle_message(consumer, conn, database_settings, settings, message, stop: 
             future_tolerance=settings.future_timestamp_tolerance,
         )
     except ValueError as exc:
-        logger.error(
-            "rejected message topic=%s partition=%s offset=%s reason=%s payload=%s",
-            message.topic(),
-            message.partition(),
-            message.offset(),
-            exc,
-            _payload_excerpt(message.value()),
+        log_event(
+            logger,
+            logging.ERROR,
+            "message_rejected",
+            topic=message.topic(),
+            partition=message.partition(),
+            offset=message.offset(),
+            reason=exc,
+            payload=_payload_excerpt(message.value()),
         )
         if assignment.owns(message):
             consumer.commit(message=message, asynchronous=False)
         return conn
 
-    logger.info(
-        "consumed topic=%s partition=%s offset=%s station_id=%s observation_time=%s measurement_type=%s value=%s unit=%s source=%s ingested_at=%s",
-        message.topic(),
-        message.partition(),
-        message.offset(),
-        record.station_id,
-        record.observation_time.isoformat(),
-        record.measurement_type,
-        record.value,
-        record.unit,
-        record.source,
-        record.ingested_at.isoformat(),
+    log_event(
+        logger,
+        logging.INFO,
+        "message_consumed",
+        topic=message.topic(),
+        partition=message.partition(),
+        offset=message.offset(),
+        station_id=record.station_id,
+        observation_time=record.observation_time,
+        measurement_type=record.measurement_type,
+        value=record.value,
+        unit=record.unit,
+        source=record.source,
+        ingested_at=record.ingested_at,
     )
     while not stop.is_set():
         try:
             conn = _ensure_connection(conn, database_settings)
-            result = persist_and_commit(consumer, conn, message, record, assignment)
-            _log_write(message, result)
-            return conn
-        except PartitionRevoked:
-            logger.warning(
-                "partition revoked before offset commit topic=%s partition=%s offset=%s",
-                message.topic(),
-                message.partition(),
-                message.offset(),
+            result = write_observation(
+                conn,
+                record,
+                topic=message.topic(),
+                kafka_partition=message.partition(),
+                kafka_offset=message.offset(),
             )
-            return conn
-        except Exception:
-            logger.exception(
-                "database write failed topic=%s partition=%s offset=%s",
-                message.topic(),
-                message.partition(),
-                message.offset(),
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "database_write_failed",
+                topic=message.topic(),
+                partition=message.partition(),
+                offset=message.offset(),
+                error=exc,
+                exc_info=True,
             )
             conn = _reconnect(conn, database_settings)
             _service_rebalance(consumer, assignment)
             if not assignment.owns(message):
-                logger.warning(
-                    "partition revoked during retry topic=%s partition=%s offset=%s",
-                    message.topic(),
-                    message.partition(),
-                    message.offset(),
-                )
+                _log_revoked(message)
                 return conn
             _wait(stop, settings.retry_seconds)
-    logger.info(
-        "shutdown before offset commit topic=%s partition=%s offset=%s",
-        message.topic(),
-        message.partition(),
-        message.offset(),
+            continue
+        _log_write(message, result)
+        if monitor is not None:
+            monitor.record_consumer_write(datetime.now(timezone.utc))
+        try:
+            _service_rebalance(consumer, assignment)
+            if not assignment.owns(message):
+                raise PartitionRevoked(f"{message.topic()} [{message.partition()}]")
+            consumer.commit(message=message, asynchronous=False)
+        except PartitionRevoked:
+            _log_revoked(message)
+            return conn
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "offset_commit_failed",
+                topic=message.topic(),
+                partition=message.partition(),
+                offset=message.offset(),
+                error=exc,
+                exc_info=True,
+            )
+            _service_rebalance(consumer, assignment)
+            if not assignment.owns(message):
+                _log_revoked(message)
+                return conn
+            _wait(stop, settings.retry_seconds)
+            continue
+        log_event(
+            logger,
+            logging.INFO,
+            "offset_committed",
+            topic=message.topic(),
+            partition=message.partition(),
+            offset=message.offset(),
+        )
+        return conn
+    log_event(
+        logger,
+        logging.INFO,
+        "shutdown_before_commit",
+        topic=message.topic(),
+        partition=message.partition(),
+        offset=message.offset(),
     )
     return conn
 
@@ -210,11 +262,13 @@ def _service_rebalance(consumer, assignment: Assignment) -> None:
             if extra is None:
                 return
             assignment.pending.append(extra)
-            logger.info(
-                "queued message polled while servicing rebalance topic=%s partition=%s offset=%s",
-                extra.topic(),
-                extra.partition(),
-                extra.offset(),
+            log_event(
+                logger,
+                logging.INFO,
+                "rebalance_message_queued",
+                topic=extra.topic(),
+                partition=extra.partition(),
+                offset=extra.offset(),
             )
     finally:
         current = assignment.topic_partitions()
@@ -235,22 +289,45 @@ def _payload_excerpt(payload) -> str:
     return text
 
 
+def _log_revoked(message) -> None:
+    log_event(
+        logger,
+        logging.WARNING,
+        "commit_skipped_partition_revoked",
+        topic=message.topic(),
+        partition=message.partition(),
+        offset=message.offset(),
+    )
+
+
 def _log_write(message, result: WriteResult) -> None:
-    logger.info(
-        "stored topic=%s partition=%s offset=%s raw_inserted=%s canonical_written=%s",
-        message.topic(),
-        message.partition(),
-        message.offset(),
-        result.raw_inserted,
-        result.canonical_written,
+    log_event(
+        logger,
+        logging.INFO,
+        "database_transaction_committed",
+        topic=message.topic(),
+        partition=message.partition(),
+        offset=message.offset(),
+        raw_inserted=result.raw_inserted,
+        canonical_written=result.canonical_written,
     )
     if not result.raw_inserted:
-        logger.info(
-            "duplicate raw delivery topic=%s partition=%s offset=%s",
-            message.topic(),
-            message.partition(),
-            message.offset(),
+        log_event(
+            logger,
+            logging.INFO,
+            "raw_duplicate",
+            topic=message.topic(),
+            partition=message.partition(),
+            offset=message.offset(),
         )
+    log_event(
+        logger,
+        logging.INFO,
+        "canonical_updated" if result.canonical_written else "canonical_unchanged",
+        topic=message.topic(),
+        partition=message.partition(),
+        offset=message.offset(),
+    )
 
 
 def _ensure_connection(conn, settings: DatabaseSettings):
@@ -263,16 +340,16 @@ def _reconnect(conn, settings: DatabaseSettings):
     if conn is not None and not conn.closed:
         try:
             conn.rollback()
-        except Exception:
-            logger.exception("rollback failed")
+        except Exception as exc:
+            log_event(logger, logging.ERROR, "database_rollback_failed", error=exc, exc_info=True)
         try:
             conn.close()
-        except Exception:
-            logger.exception("closing database connection failed")
+        except Exception as exc:
+            log_event(logger, logging.ERROR, "database_close_failed", error=exc, exc_info=True)
     try:
         return connect(settings)
-    except Exception:
-        logger.exception("database reconnect failed")
+    except Exception as exc:
+        log_event(logger, logging.ERROR, "database_reconnect_failed", error=exc, exc_info=True)
         return None
 
 
@@ -291,9 +368,9 @@ def _wait(stop: threading.Event, seconds: float) -> None:
 def _install_signal_handlers(stop: threading.Event) -> None:
     def handle_signal(signum, _frame) -> None:
         if stop.is_set():
-            logger.warning("second signal %s received; exiting now", signum)
+            log_event(logger, logging.WARNING, "shutdown_forced", signal=signum)
             raise SystemExit(1)
-        logger.info("signal %s received; stopping after the current message", signum)
+        log_event(logger, logging.INFO, "shutdown_requested", signal=signum, after="current_message")
         stop.set()
 
     signal.signal(signal.SIGINT, handle_signal)

@@ -4,3 +4,5 @@ __pycache__/
 .env
 data/checkpoints/*.json
 data/checkpoints/*.tmp
+data/health/*.json
+data/health/*.tmp

@@ -49,6 +49,43 @@ class PaginationTests(unittest.TestCase):
                 max_pages=10,
             )
 
+    def test_logs_a_successful_request_with_duration_status_and_attempt(self) -> None:
+        client = HubeauClient("https://hubeau.eaufrance.fr/api/v2/hydrometrie")
+        client._client = FakeHttp([response({"data": [{"date_obs": "a"}], "next": None})])
+
+        with self.assertLogs("src.producer.api_client", level="INFO") as logs:
+            client.fetch_observations(
+                "Y251002001",
+                "H",
+                datetime(2026, 10, 20, tzinfo=timezone.utc),
+                page_size=500,
+                max_pages=10,
+                attempt=2,
+            )
+
+        text = " ".join(logs.output)
+        self.assertIn("event=api_request", text)
+        self.assertIn("status=200", text)
+        self.assertIn("attempt=2", text)
+        self.assertIn("duration_ms=", text)
+        self.assertIn("page=1", text)
+        self.assertEqual(client.pages_fetched, 1)
+
+    def test_logs_a_failed_request_with_status(self) -> None:
+        client = HubeauClient("https://hubeau.eaufrance.fr/api/v2/hydrometrie")
+        client._client = FakeHttp([response({"data": []}, status=503)])
+
+        with self.assertLogs("src.producer.api_client", level="WARNING") as logs:
+            with self.assertRaises(httpx.HTTPStatusError):
+                _fetch(client)
+
+        text = " ".join(logs.output)
+        self.assertIn("event=api_request_failed", text)
+        self.assertIn("status=503", text)
+        self.assertIn("attempt=1", text)
+        self.assertIn("duration_ms=", text)
+        self.assertNotIn("event=api_request ", text)
+
     def test_page_cap_stops_before_another_request(self) -> None:
         client = HubeauClient("https://hubeau.eaufrance.fr/api/v2/hydrometrie")
         fake = FakeHttp(

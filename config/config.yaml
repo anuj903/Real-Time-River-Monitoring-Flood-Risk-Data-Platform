@@ -33,3 +33,16 @@ consumer:
   retry_seconds: 5
   auto_offset_reset: earliest
   max_poll_interval_ms: 900000
+
+health:
+  # Source observation_time older than this is stale data, not by itself a stopped pipeline.
+  stale_after_seconds: 3600
+  ingestion_delay_seconds: 900
+  producer_stall_seconds: 300
+  producer_failure_threshold: 3
+  consumer_stall_seconds: 300
+  startup_grace_seconds: 300
+  check_interval_seconds: 300
+  log_repeat_seconds: 900
+  producer_status_path: data/health/producer.json
+  consumer_status_path: data/health/consumer.json

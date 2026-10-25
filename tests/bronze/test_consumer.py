@@ -238,12 +238,93 @@ class RejectionLogTests(unittest.TestCase):
                 _owns(),
             )
 
-        self.assertIn("rejected message", logs.output[0])
+        self.assertIn("event=message_rejected", logs.output[0])
         self.assertIn("topic=water.observations.raw", logs.output[0])
         self.assertIn("partition=2", logs.output[0])
         self.assertIn("offset=5", logs.output[0])
         self.assertIn("payload=not-json", logs.output[0])
         consumer.commit.assert_called_once_with(message=message, asynchronous=False)
+
+    def test_database_write_failure_is_separate_from_a_commit_failure(self) -> None:
+        consumer = Mock()
+        stop = threading.Event()
+
+        def write(_conn, _record, **_kwargs):
+            stop.set()
+            raise RuntimeError("database unavailable")
+
+        with patch("src.bronze.consumer._service_rebalance"):
+            with patch("src.bronze.consumer.write_observation", write):
+                with patch("src.bronze.consumer._reconnect", side_effect=lambda conn, _settings: conn):
+                    with self.assertLogs("src.bronze.consumer", level="ERROR") as logs:
+                        _handle_message(
+                            consumer,
+                            Mock(closed=False),
+                            Mock(),
+                            _retry_settings(),
+                            _message(),
+                            stop,
+                            _owns(),
+                        )
+
+        text = " ".join(logs.output)
+        self.assertIn("event=database_write_failed", text)
+        self.assertIn("offset=5", text)
+        self.assertNotIn("event=offset_commit_failed", text)
+        consumer.commit.assert_not_called()
+
+    def test_commit_failure_is_separate_from_a_database_write_failure(self) -> None:
+        consumer = Mock()
+        attempts = {"commit": 0}
+
+        def commit(message, asynchronous):
+            attempts["commit"] += 1
+            if attempts["commit"] == 1:
+                raise RuntimeError("coordinator unavailable")
+
+        consumer.commit.side_effect = commit
+        connection = Mock()
+        connection.closed = False
+
+        with patch("src.bronze.consumer._service_rebalance"):
+            with patch(
+                "src.bronze.consumer.write_observation",
+                return_value=WriteResult(raw_inserted=False, canonical_written=True),
+            ):
+                with self.assertLogs("src.bronze.consumer", level="INFO") as logs:
+                    _handle_message(
+                        consumer,
+                        connection,
+                        Mock(),
+                        _retry_settings(),
+                        _message(),
+                        threading.Event(),
+                        _owns(),
+                    )
+
+        text = " ".join(logs.output)
+        self.assertIn("event=offset_commit_failed", text)
+        self.assertIn("event=database_transaction_committed", text)
+        self.assertIn("event=raw_duplicate", text)
+        self.assertIn("event=canonical_updated", text)
+        self.assertIn("event=offset_committed", text)
+        self.assertNotIn("event=database_write_failed", text)
+
+    def test_rebalance_logs_assignment_and_revocation(self) -> None:
+        from confluent_kafka import TopicPartition
+
+        from src.bronze.consumer import Assignment
+
+        assignment = Assignment()
+        partitions = [TopicPartition("water.observations.raw", 2)]
+        with self.assertLogs("src.bronze.consumer", level="INFO") as logs:
+            assignment.on_assign(Mock(), partitions)
+            assignment.on_revoke(Mock(), partitions)
+
+        text = " ".join(logs.output)
+        self.assertIn("event=partitions_assigned", text)
+        self.assertIn("event=partitions_revoked", text)
+        self.assertIn("partitions=water.observations.raw:2", text)
 
 
 def _owns():
