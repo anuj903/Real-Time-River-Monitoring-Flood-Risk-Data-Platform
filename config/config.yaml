@@ -7,6 +7,14 @@ hubeau:
   lookback_minutes: 60
   page_size: 500
 
+# Measurement type to the unit this pipeline publishes. Add discharge here, for example Q: l/s.
+measurements:
+  H: mm
+
+quality:
+  # Source observation_time may be this far ahead of the local clock. No water-level limits are applied.
+  future_timestamp_tolerance_seconds: 300
+
 kafka:
   bootstrap_servers: localhost:9092
   topic: water.observations.raw

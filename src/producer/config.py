@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
+from typing import Mapping
 
 import yaml
 from dotenv import load_dotenv
+
+from src.common.quality import future_tolerance_from_config, measurement_units_from_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
@@ -26,6 +32,8 @@ class Settings:
     max_pages: int
     catchup_max_age_days: int
     source: str = "hubeau"
+    measurement_units: Mapping[str, str] = field(default_factory=lambda: {"H": "mm"})
+    future_timestamp_tolerance: timedelta = timedelta(seconds=300)
 
 
 def load_settings() -> Settings:
@@ -36,11 +44,20 @@ def load_settings() -> Settings:
     hubeau = raw["hubeau"]
     kafka = raw["kafka"]
     producer = raw["producer"]
+    measurement_units = measurement_units_from_config(raw)
+    grandeur_hydro = str(hubeau["grandeur_hydro"]).strip()
+    unit = str(hubeau["unit"]).strip()
+    if measurement_units.get(grandeur_hydro) != unit:
+        raise RuntimeError(
+            f"configured unit {unit!r} does not match measurements[{grandeur_hydro!r}]"
+        )
     return Settings(
         base_url=hubeau["base_url"],
         station_code=hubeau["station_code"],
-        grandeur_hydro=hubeau["grandeur_hydro"],
-        unit=hubeau["unit"],
+        grandeur_hydro=grandeur_hydro,
+        unit=unit,
+        measurement_units=measurement_units,
+        future_timestamp_tolerance=future_tolerance_from_config(raw),
         lookback_minutes=int(hubeau["lookback_minutes"]),
         page_size=int(hubeau["page_size"]),
         bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", kafka["bootstrap_servers"]),

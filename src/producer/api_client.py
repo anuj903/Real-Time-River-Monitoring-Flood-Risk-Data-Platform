@@ -9,6 +9,10 @@ class HubeauPageLimitError(RuntimeError):
     """Raised when cursor pagination exceeds the configured page cap."""
 
 
+class HubeauResponseError(ValueError):
+    """Raised when a Hub'Eau page is not the expected JSON object."""
+
+
 class HubeauClient:
     """Reads real-time hydrometric observations from Hub'Eau."""
 
@@ -44,9 +48,8 @@ class HubeauClient:
                 )
             response = self._client.get(url, params=params)
             response.raise_for_status()
-            payload = response.json()
-            rows.extend(payload.get("data") or [])
-            url = payload.get("next")
+            page_rows, url = _page(response)
+            rows.extend(page_rows)
             params = None
             pages += 1
 
@@ -55,3 +58,21 @@ class HubeauClient:
 
 def _format_api_time(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _page(response) -> tuple[list, str | None]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HubeauResponseError("Hub'Eau response is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HubeauResponseError("Hub'Eau response must be a JSON object")
+    if "data" not in payload:
+        raise HubeauResponseError("Hub'Eau response is missing data")
+    data = payload["data"]
+    if not isinstance(data, list):
+        raise HubeauResponseError("Hub'Eau data must be a list")
+    next_url = payload.get("next")
+    if next_url is not None and not isinstance(next_url, str):
+        raise HubeauResponseError("Hub'Eau next link must be a string or null")
+    return data, next_url

@@ -12,7 +12,13 @@ from confluent_kafka import Producer
 from pydantic import BaseModel
 
 from src.common.logging_config import configure_logging
-from src.producer.api_client import HubeauClient, HubeauPageLimitError
+from src.common.quality import (
+    require_finite,
+    require_measurement_unit,
+    require_not_future,
+    require_timezone,
+)
+from src.producer.api_client import HubeauClient, HubeauPageLimitError, HubeauResponseError
 from src.producer.checkpoint import load_checkpoint, save_checkpoint
 from src.producer.config import PROJECT_ROOT, Settings, load_settings
 
@@ -34,15 +40,55 @@ class WaterObservation(BaseModel):
 
 
 def to_event(row: dict, settings: Settings, ingested_at: datetime) -> WaterObservation | None:
-    observed_at = row.get("date_obs")
-    value = row.get("resultat_obs")
-    if not observed_at or value is None:
+    """Return one valid event, or None when this source row cannot be published."""
+    try:
+        return _event_from_row(row, settings, ingested_at)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "skipped malformed source row error=%s station_id=%s observation_time=%s measurement_type=%s",
+            exc,
+            row.get("code_station") if isinstance(row, dict) else None,
+            row.get("date_obs") if isinstance(row, dict) else None,
+            row.get("grandeur_hydro") if isinstance(row, dict) else None,
+        )
         return None
+
+
+def _event_from_row(row: dict, settings: Settings, ingested_at: datetime) -> WaterObservation:
+    if not isinstance(row, dict):
+        raise ValueError("source row must be an object")
+    observed_at = row.get("date_obs")
+    raw_value = row.get("resultat_obs")
+    station_id = row.get("code_station")
+    measurement_type = row.get("grandeur_hydro")
+    if not isinstance(observed_at, str) or not observed_at.strip():
+        raise ValueError("date_obs must be a timestamp string")
+    if not isinstance(station_id, str) or not station_id.strip():
+        raise ValueError("code_station must be a non-blank string")
+    if not isinstance(measurement_type, str) or not measurement_type.strip():
+        raise ValueError("grandeur_hydro must be a non-blank string")
+    if station_id.strip() != settings.station_code:
+        raise ValueError(f"code_station '{station_id.strip()}' does not match {settings.station_code}")
+    if measurement_type.strip() != settings.grandeur_hydro:
+        raise ValueError(
+            f"grandeur_hydro '{measurement_type.strip()}' does not match the requested {settings.grandeur_hydro}"
+        )
+    observation_time = datetime.fromisoformat(observed_at.strip().replace("Z", "+00:00"))
+    observation_time = require_timezone(observation_time, "date_obs")
+    value = require_finite(raw_value, "resultat_obs")
+    measurement_type = measurement_type.strip()
+    require_measurement_unit(measurement_type, settings.unit, settings.measurement_units)
+    require_not_future(
+        observation_time,
+        "date_obs",
+        now=ingested_at,
+        tolerance=settings.future_timestamp_tolerance,
+    )
     return WaterObservation(
-        station_id=row["code_station"],
-        observation_time=datetime.fromisoformat(observed_at.replace("Z", "+00:00")),
-        measurement_type=row["grandeur_hydro"],
-        value=float(value),
+        station_id=station_id.strip(),
+        observation_time=observation_time,
+        measurement_type=measurement_type,
+        value=value,
         unit=settings.unit,
         source=settings.source,
         ingested_at=ingested_at,
@@ -146,14 +192,16 @@ def poll_once(
             skipped += 1
             continue
         events.append(event)
+    events, duplicates = _collapse_duplicate_rows(events)
     events.sort(key=lambda event: event.observation_time)
 
     logger.info(
-        "fetched %s observation(s) for %s since %s; skipped %s incomplete row(s)",
+        "fetched %s observation(s) for %s since %s; skipped %s incomplete row(s); ignored %s duplicate source row(s)",
         len(events),
         settings.station_code,
         start.isoformat(),
         skipped,
+        duplicates,
     )
     if not events:
         return 0
@@ -176,6 +224,27 @@ def poll_once(
     return published
 
 
+def _collapse_duplicate_rows(events: list[WaterObservation]) -> tuple[list[WaterObservation], int]:
+    """Keep the last value for each observation key and count the rows that were dropped."""
+    unique: dict[tuple[str, str, datetime], WaterObservation] = {}
+    duplicates = 0
+    for event in events:
+        key = (event.station_id, event.measurement_type, event.observation_time)
+        previous = unique.get(key)
+        if previous is not None:
+            duplicates += 1
+            logger.warning(
+                "duplicate source row station_id=%s measurement_type=%s observation_time=%s previous_value=%s value=%s",
+                event.station_id,
+                event.measurement_type,
+                event.observation_time.isoformat(),
+                previous.value,
+                event.value,
+            )
+        unique[key] = event
+    return list(unique.values()), duplicates
+
+
 def _retry(stop, settings: Settings, action, description: str, is_retryable):
     delay = settings.retry_backoff_seconds
     for attempt in range(1, settings.max_attempts + 1):
@@ -186,6 +255,8 @@ def _retry(stop, settings: Settings, action, description: str, is_retryable):
         except PollStopped:
             raise
         except HubeauPageLimitError:
+            raise
+        except HubeauResponseError:
             raise
         except Exception as exc:
             if not is_retryable(exc) or attempt == settings.max_attempts:

@@ -439,3 +439,27 @@ Kafka fundamentals, TimescaleDB concepts, implementation decisions, errors encou
 
 docs/roadmap.md
 Completed milestones, open problems, next steps, acceptance criteria, and future cloud architecture.
+
+18. Phase 1 checks and issues found, 24 October 2026
+These checks were run against the live pipeline before leaving Phase 1. Kafka topic water.observations.raw and TimescaleDB database water were left in place. No offsets were reset and no tables were cleared.
+
+Canonical consistency
+Passed. observations had 1,238 rows and 1,238 distinct (station_id, measurement_type, observation_time) keys. A grouped count found no key with more than one row. The reading whose commit failed on 24 October, Y251002001 / H / 2026-10-21 12:55:00+00, has one raw delivery at partition 2 offset 1175 and one canonical row.
+
+Consumer health during the failed commits
+The database write for offset 1175 had already committed. The failure was the following Kafka offset commit, which the consumer logged under the generic message "database write failed".
+
+At 15:58 the broker connection broke. librdkafka reported "Broker transport failure", then the group session timed out after 45 seconds and the commit returned COORDINATOR_NOT_AVAILABLE. The retry returned UNKNOWN_MEMBER_ID because the coordinator had removed the member. The consumer then revoked partitions 0-2 and left offset 1175 uncommitted. Restarting only the Python process did not help: the new process joined, but SyncGroupRequest stayed in flight until it timed out. The broker log shows the group stuck in CompletingRebalance. Each attempt to store the assignment on __consumer_offsets partition 46 timed out after 5 seconds with COORDINATOR_NOT_AVAILABLE. Shortly after that Kafka container started, its group-coordinator thread also logged "Histogram recorded value cannot be negative" while handling HighWatermarkUpdate. The partition was online and small, so this was a coordinator write failure, not a full topic outage, a database error, or a normal rebalance.
+
+The consumer was stopped, Kafka was restarted without deleting its volume, and the consumer was started again. It rejoined and continued from offset 1175. Replaying that message did not add a second canonical row.
+
+Recovery completeness
+Passed for the retained log. On partition 2 the log now starts at offset 30; offsets 0-29 are no longer retained. Every stored raw offset from 30 through the latest offset is present, with none missing in that range. The consumer group water-observations-bronze was Stable with lag 0 on partition 2. Partitions 0 and 1 have no records.
+
+The producer catch-up at 19:12 fetched 22 observations since the checkpoint 2026-10-24T11:45:00Z, skipped 0 incomplete rows, and did not hit the page limit. All 22 publishes were rejected with INVALID_RECORD, "Broker failed to validate record". The checkpoint stayed at 11:45 because it advances only after a successful flush. The next poll fetched the same 22 observations, published them at offsets 2097-2118, and advanced the checkpoint to 2026-10-24T13:30:00Z. The consumer stored that batch. Later polls published the newer 13:30 and 13:35 readings. The checkpoint file matches the latest canonical observation time.
+
+Known gaps that are not unprocessed Kafka messages
+The canonical series is not a continuous 5-minute record. The largest holes are 2026-10-14 12:00Z to 2026-10-18 13:45Z and 2026-10-18 14:30Z to 2026-10-20 08:20Z, plus three shorter holes of 7 hours 15 minutes, 20 minutes, and 15 minutes. Those times were never published. They come from periods when the producer was not running, including the period before the checkpoint existed, when a restart only reloaded the last 60 minutes. Hub'Eau also does not always return every 5-minute step. The consumer did not skip retained offsets.
+
+Phase 1 result
+The three checks pass, and the commit failure has a clear cause: loss of the Kafka group coordinator, followed by the broker being unable to persist the group assignment. Phase 1 can close. The open items above are operational lessons, not an unfinished recovery: coordinator writes can wedge the group until Kafka is restarted, a stale producer batch can be rejected with INVALID_RECORD and must be retried without moving the checkpoint, and downtime still leaves historical holes that the retained Kafka log cannot fill.

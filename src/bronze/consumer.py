@@ -127,14 +127,19 @@ def run() -> None:
 
 def _handle_message(consumer, conn, database_settings, settings, message, stop: threading.Event, assignment: Assignment):
     try:
-        record = parse_event(message.value())
+        record = parse_event(
+            message.value(),
+            measurement_units=settings.measurement_units,
+            future_tolerance=settings.future_timestamp_tolerance,
+        )
     except ValueError as exc:
         logger.error(
-            "invalid message topic=%s partition=%s offset=%s error=%s",
+            "rejected message topic=%s partition=%s offset=%s reason=%s payload=%s",
             message.topic(),
             message.partition(),
             message.offset(),
             exc,
+            _payload_excerpt(message.value()),
         )
         if assignment.owns(message):
             consumer.commit(message=message, asynchronous=False)
@@ -215,6 +220,19 @@ def _service_rebalance(consumer, assignment: Assignment) -> None:
         current = assignment.topic_partitions()
         if current:
             consumer.resume(current)
+
+
+def _payload_excerpt(payload) -> str:
+    if isinstance(payload, bytes):
+        text = payload.decode("utf-8", errors="replace")
+    elif payload is None:
+        text = ""
+    else:
+        text = str(payload)
+    text = " ".join(text.split())
+    if len(text) > 500:
+        return text[:500] + "..."
+    return text
 
 
 def _log_write(message, result: WriteResult) -> None:

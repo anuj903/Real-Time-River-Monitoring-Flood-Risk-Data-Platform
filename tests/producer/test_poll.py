@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ import httpx
 
 from src.producer.checkpoint import load_checkpoint
 from src.producer.config import Settings
+from src.producer.api_client import HubeauResponseError
 from src.producer.producer import PollStopped, poll_once
 
 
@@ -91,6 +93,67 @@ class PollOnceTests(unittest.TestCase):
 
             self.assertEqual(producer.produced, 0)
 
+    def test_malformed_source_row_does_not_abort_the_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "producer.json"
+            settings = _settings(str(path))
+            producer = FakeProducer()
+            rows = [
+                {"date_obs": "not-a-timestamp", "resultat_obs": -1, "code_station": "Y251002001", "grandeur_hydro": "H"},
+                _row("2026-10-20T10:00:00Z"),
+            ]
+
+            with self.assertLogs("src.producer.producer", level="WARNING") as logs:
+                published = poll_once(
+                    _client(rows),
+                    producer,
+                    settings,
+                    threading.Event(),
+                    now=datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(published, 1)
+            self.assertIn("skipped malformed source row", " ".join(logs.output))
+            stored = load_checkpoint(path, "Y251002001", "H")
+            self.assertEqual(stored, datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc))
+
+    def test_duplicate_source_rows_publish_the_latest_value_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(str(Path(directory) / "producer.json"))
+            producer = FakeProducer()
+            rows = [
+                _row("2026-10-20T10:00:00Z", resultat_obs=-300.0),
+                _row("2026-10-20T10:00:00Z", resultat_obs=-280.0),
+            ]
+
+            with self.assertLogs("src.producer.producer", level="WARNING") as logs:
+                published = poll_once(
+                    _client(rows),
+                    producer,
+                    settings,
+                    threading.Event(),
+                    now=datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(published, 1)
+            self.assertEqual(producer.produced, 1)
+            self.assertEqual(json.loads(producer.values[0])["value"], -280.0)
+            self.assertIn("duplicate source row", " ".join(logs.output))
+
+    def test_malformed_api_page_does_not_advance_the_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "producer.json"
+            settings = _settings(str(path), max_attempts=2)
+            producer = FakeProducer()
+            client = FakeClient(errors=[HubeauResponseError("Hub'Eau data must be a list")])
+
+            with self.assertRaises(HubeauResponseError):
+                poll_once(client, producer, settings, threading.Event())
+
+            self.assertEqual(producer.produced, 0)
+            self.assertEqual(len(client.calls), 1)
+            self.assertFalse(path.exists())
+
 
 def _settings(path: str, **overrides) -> Settings:
     values = dict(
@@ -113,13 +176,15 @@ def _settings(path: str, **overrides) -> Settings:
     return Settings(**values)
 
 
-def _row(observed: str) -> dict:
-    return {
+def _row(observed: str, **overrides) -> dict:
+    row = {
         "code_station": "Y251002001",
         "date_obs": observed,
         "resultat_obs": -300.0,
         "grandeur_hydro": "H",
     }
+    row.update(overrides)
+    return row
 
 
 def _client(rows):
@@ -144,9 +209,11 @@ class FakeProducer:
         self.fail = fail
         self.produced = 0
         self.flushes = 0
+        self.values = []
 
-    def produce(self, **_kwargs) -> None:
+    def produce(self, **kwargs) -> None:
         self.produced += 1
+        self.values.append(kwargs.get("value"))
 
     def poll(self, _timeout) -> None:
         return None
